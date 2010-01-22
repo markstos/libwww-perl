@@ -94,16 +94,41 @@ sub clear
     %$self = ();
 }
 
-
-sub push_header
-{
+sub push_header {
     my $self = shift;
-    return $self->_header(@_, 'PUSH_H') if @_ == 2;
-    while (@_) {
-	$self->_header(splice(@_, 0, 2), 'PUSH_H');
-    }
-}
 
+    if (@_ == 2) {
+        my ($field, $val) = @_;
+        $field = _standardize_field_name($field) unless $field =~ /^:/;
+
+        my $h = $self->{$field};
+        if (!defined $h) {
+            $h = [];
+            $self->{$field} = $h;
+        } elsif (ref $h ne 'ARRAY') {
+            $h = [ $h ];
+            $self->{$field} = $h;
+        }
+    
+        push @$h, ref $val ne 'ARRAY' ? $val : @$val;
+    } else {
+        while ( my ($field, $val) = splice( @_, 0, 2 ) ) {
+            $field = _standardize_field_name($field) unless $field =~ /^:/;
+
+            my $h = $self->{$field};
+            if (!defined $h) {
+                $h = [];
+                $self->{$field} = $h;
+            } elsif (ref $h ne 'ARRAY') {
+                $h = [ $h ];
+                $self->{$field} = $h;
+            }
+    
+            push @$h, ref $val ne 'ARRAY' ? $val : @$val;
+        }
+    }
+    return ();
+}
 
 sub init_header
 {
@@ -418,6 +443,26 @@ sub _basic_auth {
 	return split(/:/, $val, 2);
     }
     return;
+}
+
+my %field_name;
+sub _standardize_field_name {
+    my $field = shift;
+
+    $field =~ tr/_/-/ if $TRANSLATE_UNDERSCORE;
+    if (my $cache = $field_name{$field}) {
+        return $cache;
+    }
+
+    my $old = $field;
+    $field = lc $field;
+    unless ( defined $standard_case{$field} ) {
+        # generate a %standard_case entry for this field
+        $old =~ s/\b(\w)/\u$1/g;
+        $standard_case{$field} = $old;
+    }
+    $field_name{$old} = $field;
+    return $field;
 }
 
 
