@@ -15,6 +15,11 @@ $TRANSLATE_UNDERSCORE = 1 unless defined $TRANSLATE_UNDERSCORE;
 #    - Request-Headers
 #    - Response-Headers
 #    - Entity-Headers
+my $OP_GET    = 0;
+my $OP_SET    = 1;
+my $OP_INIT   = 2;
+my $OP_PUSH   = 3;
+
 
 my @general_headers = qw(
     Cache-Control Connection Date Pragma Trailer Transfer-Encoding Upgrade
@@ -71,21 +76,29 @@ sub new
     $self;
 }
 
-
-sub header
-{
+sub header {
     my $self = shift;
     Carp::croak('Usage: $h->header($field, ...)') unless @_;
-    my(@old);
-    my %seen;
-    while (@_) {
-	my $field = shift;
-        my $op = @_ ? ($seen{lc($field)}++ ? 'PUSH' : 'SET') : 'GET';
-	@old = $self->_header($field, shift, $op);
+    my (@old);
+
+    if (@_ == 1) {
+        @old = $self->_header_get(@_);
+    } elsif( @_ == 2 ) {
+        @old = $self->_header_set(@_);
+    } else {
+        my %seen;
+        while (@_) {
+            my $field = shift;
+            if ( $seen{ lc $field }++ ) {
+                @old = $self->_header_push($field, shift);
+            } else {
+                @old = $self->_header_set($field, shift);
+            }
+        }
     }
-    return @old if wantarray;
+    return @old    if wantarray;
     return $old[0] if @old <= 1;
-    join(", ", @old);
+    join( ", ", @old );
 }
 
 sub clear
@@ -130,12 +143,10 @@ sub push_header {
     return ();
 }
 
-sub init_header
-{
+sub init_header {
     Carp::croak('Usage: $h->init_header($field, $val)') if @_ != 3;
-    shift->_header(@_, 'INIT');
+    shift->_header( @_, $OP_INIT );
 }
-
 
 sub remove_header
 {
@@ -167,55 +178,30 @@ sub remove_content_headers
 }
 
 
-sub _header
-{
-    my($self, $field, $val, $op) = @_;
+sub _header {
+    my ($self, $field, $val, $op) = @_;
 
-    unless ($field =~ /^:/) {
-	$field =~ tr/_/-/ if $TRANSLATE_UNDERSCORE;
-	my $old = $field;
-	$field = lc $field;
-	unless(defined $standard_case{$field}) {
-	    # generate a %standard_case entry for this field
-	    $old =~ s/\b(\w)/\u$1/g;
-	    $standard_case{$field} = $old;
-	}
-    }
+    $field = _standardize_field_name($field) unless $field =~ /^:/;
 
-    $op ||= defined($val) ? 'SET' : 'GET';
-    if ($op eq 'PUSH_H') {
-	# Like PUSH but where we don't care about the return value
-	if (exists $self->{$field}) {
-	    my $h = $self->{$field};
-	    if (ref($h) eq 'ARRAY') {
-		push(@$h, ref($val) eq "ARRAY" ? @$val : $val);
-	    }
-	    else {
-		$self->{$field} = [$h, ref($val) eq "ARRAY" ? @$val : $val]
-	    }
-	    return;
-	}
-	$self->{$field} = $val;
-	return;
-    }
+    $op ||= defined($val) ? $OP_SET : $OP_GET;
 
     my $h = $self->{$field};
-    my @old = ref($h) eq 'ARRAY' ? @$h : (defined($h) ? ($h) : ());
+    my @old = ref($h) eq 'ARRAY' ? @$h : ( defined($h) ? ($h) : () );
 
-    unless ($op eq 'GET' || ($op eq 'INIT' && @old)) {
-	if (defined($val)) {
-	    my @new = ($op eq 'PUSH') ? @old : ();
-	    if (ref($val) ne 'ARRAY') {
-		push(@new, $val);
-	    }
-	    else {
-		push(@new, @$val);
-	    }
-	    $self->{$field} = @new > 1 ? \@new : $new[0];
-	}
-	elsif ($op ne 'PUSH') {
-	    delete $self->{$field};
-	}
+    unless ( $op == $OP_GET || ( $op == $OP_INIT && @old ) ) {
+        if ( defined($val) ) {
+            my @new = ( $op == $OP_PUSH ) ? @old : ();
+            if ( ref($val) ne 'ARRAY' ) {
+                push( @new, $val );
+            }
+            else {
+                push( @new, @$val );
+            }
+            $self->{$field} = @new > 1 ? \@new : $new[0];
+        }
+        elsif ( $op != $OP_PUSH ) {
+            delete $self->{$field};
+        }
     }
     @old;
 }
@@ -258,28 +244,59 @@ sub scan
     }
 }
 
-
-sub as_string
-{
-    my($self, $endl) = @_;
-    $endl = "\n" unless defined $endl;
-
-    my @result = ();
-    $self->scan(sub {
-	my($field, $val) = @_;
-	$field =~ s/^://;
-	if ($val =~ /\n/) {
-	    # must handle header values with embedded newlines with care
-	    $val =~ s/\s+$//;          # trailing newlines and space must go
-	    $val =~ s/\n(\x0d?\n)+/\n/g;      # no empty lines
-	    $val =~ s/\n([^\040\t])/\n $1/g;  # intial space for continuation
-	    $val =~ s/\n/$endl/g;      # substitute with requested line ending
-	}
-	push(@result, "$field: $val");
-    });
-
-    join($endl, @result, '');
+sub _process_newline {
+    local $_ = shift;
+    my $endl = shift;
+    # must handle header values with embedded newlines with care
+    s/\s+$//;        # trailing newlines and space must go
+    s/\n(\x0d?\n)+/\n/g;     # no empty lines
+    s/\n([^\040\t])/\n $1/g; # intial space for continuation
+    s/\n/$endl/g;    # substitute with requested line ending
+    $_;
 }
+
+sub _as_string {
+    my ($self, $endl, $fieldnames) = @_;
+
+    my @result;
+    for my $key ( @$fieldnames ) {
+        next if index($key, '_') == 0;
+        my $vals = $self->{$key};
+        if ( ref($vals) eq 'ARRAY' ) {
+            for my $val (@$vals) {
+                my $field = $standard_case{$key} || $key;
+                $field =~ s/^://;
+                if ( index($val, "\n") >= 0 ) {
+                    $val = _process_newline($val, $endl);
+                }
+                push @result, $field . ': ' . $val;
+            }
+        } else {
+            my $field = $standard_case{$key} || $key;
+            $field =~ s/^://;
+            if ( index($vals, "\n") >= 0 ) {
+                $vals = _process_newline($vals, $endl);
+            }
+            push @result, $field . ': ' . $vals;
+        }
+    }
+
+    join( $endl, @result, '' );
+}
+
+
+sub as_string {
+    my ( $self, $endl ) = @_;
+    $endl = "\n" unless defined $endl;
+    $self->_as_string($endl, [$self->_sorted_field_names]);
+}
+
+sub as_string_unsorted {
+    my ( $self, $endl ) = @_;
+    $endl = "\n" unless defined $endl;
+    $self->_as_string($endl, [keys(%$self)]);
+}
+
 
 
 if (eval { require Storable; 1 }) {
@@ -293,25 +310,25 @@ if (eval { require Storable; 1 }) {
     };
 }
 
-
-sub _date_header
-{
+sub _date_header {
     require HTTP::Date;
-    my($self, $header, $time) = @_;
-    my($old) = $self->_header($header);
-    if (defined $time) {
-	$self->_header($header, HTTP::Date::time2str($time));
+    my ( $self, $header, $time ) = @_;
+    my $old;
+    if ( defined $time ) {
+        ($old) = $self->_header_set( $header, HTTP::Date::time2str($time) );
+    } else {
+        ($old) = $self->_header_get($header, 1);
     }
     $old =~ s/;.*// if defined($old);
     HTTP::Date::str2time($old);
 }
 
+sub date                { shift->_date_header( 'date',                @_ ); }
+sub expires             { shift->_date_header( 'expires',             @_ ); }
+sub if_modified_since   { shift->_date_header( 'if-modified-since',   @_ ); }
+sub if_unmodified_since { shift->_date_header( 'if-unmodified-since', @_ ); }
+sub last_modified       { shift->_date_header( 'last-modified',       @_ ); }
 
-sub date                { shift->_date_header('Date',                @_); }
-sub expires             { shift->_date_header('Expires',             @_); }
-sub if_modified_since   { shift->_date_header('If-Modified-Since',   @_); }
-sub if_unmodified_since { shift->_date_header('If-Unmodified-Since', @_); }
-sub last_modified       { shift->_date_header('Last-Modified',       @_); }
 
 # This is used as a private LWP extension.  The Client-Date header is
 # added as a timestamp to a response when it has been received.
@@ -406,22 +423,23 @@ sub referer           {
 }
 *referrer = \&referer;  # on tchrist's request
 
-sub title             { (shift->_header('Title',            @_))[0] }
-sub content_encoding  { (shift->_header('Content-Encoding', @_))[0] }
-sub content_language  { (shift->_header('Content-Language', @_))[0] }
-sub content_length    { (shift->_header('Content-Length',   @_))[0] }
+for my $key (qw/
+    content-length content-language content-encoding title user-agent server from warnings
+    www-authenticate authorization proxy-authenticate proxy-authorization
+    /) {
+    no strict 'refs';
+    (my $meth = $key) =~ s/-/_/g;
+    *{$meth} = sub {
+        my $self = shift;
+        if (@_) {
+            ( $self->_header_set( $key, @_ ) )[0]
+        } else {
+            my $h = $self->{$key};
+            (ref($h) eq 'ARRAY') ? $h->[0] : $h;
+        }
+    };
+}
 
-sub user_agent        { (shift->_header('User-Agent',       @_))[0] }
-sub server            { (shift->_header('Server',           @_))[0] }
-
-sub from              { (shift->_header('From',             @_))[0] }
-sub warning           { (shift->_header('Warning',          @_))[0] }
-
-sub www_authenticate  { (shift->_header('WWW-Authenticate', @_))[0] }
-sub authorization     { (shift->_header('Authorization',    @_))[0] }
-
-sub proxy_authenticate  { (shift->_header('Proxy-Authenticate',  @_))[0] }
-sub proxy_authorization { (shift->_header('Proxy-Authorization', @_))[0] }
 
 sub authorization_basic       { shift->_basic_auth("Authorization",       @_) }
 sub proxy_authorization_basic { shift->_basic_auth("Proxy-Authorization", @_) }
@@ -465,6 +483,67 @@ sub _standardize_field_name {
     return $field;
 }
 
+sub _header_get {
+    my ($self, $field, $skip_standardize) = @_;
+
+    $field = _standardize_field_name($field) unless $skip_standardize || $field =~ /^:/;
+
+    my $h = $self->{$field};
+    return (ref($h) eq 'ARRAY') ? @$h : ( defined($h) ? ($h) : () );
+}
+
+sub _header_set {
+    my ($self, $field, $val) = @_;
+
+    $field = _standardize_field_name($field) unless $field =~ /^:/;
+
+    my $h = $self->{$field};
+    my @old = ref($h) eq 'ARRAY' ? @$h : ( defined($h) ? ($h) : () );
+    if ( defined($val) ) {
+        if (ref $val eq 'ARRAY' && scalar(@$val) == 1) {
+            $val = $val->[0];
+        }
+        $self->{$field} = $val;
+    } else {
+        delete $self->{$field};
+    }
+    return @old;
+}
+
+sub _header_push_no_return {
+    my ($self, $field, $val) = @_;
+
+    $field = _standardize_field_name($field) unless $field =~ /^:/;
+
+    my $h = $self->{$field};
+    if (ref($h) eq 'ARRAY') {
+        push @$h, ref $val ne 'ARRAY' ? $val : @$val;
+    } elsif (defined $h) {
+        $self->{$field} = [$h, ref $val ne 'ARRAY' ? $val : @$val ];
+    } else {
+        $self->{$field} = ref $val ne 'ARRAY' ? $val : @$val;
+    }
+    return;
+}
+
+sub _header_push {
+    my ($self, $field, $val) = @_;
+
+    $field = _standardize_field_name($field) unless $field =~ /^:/;
+
+    my $h = $self->{$field};
+    if (ref($h) eq 'ARRAY') {
+        my @old = @$h;
+        push @$h, ref $val ne 'ARRAY' ? $val : @$val;
+        return @old;
+    } elsif (defined $h) {
+        $self->{$field} = [$h, ref $val ne 'ARRAY' ? $val : @$val ];
+        return ($h);
+    } else {
+        $self->{$field} = ref $val ne 'ARRAY' ? $val : @$val;
+        return ();
+    }
+}
 
 1;
 
@@ -643,6 +722,16 @@ values are not folded.
 The optional $eol parameter specifies the line ending sequence to
 use.  The default is "\n".  Embedded "\n" characters in header field
 values will be substituted with this line ending sequence.
+
+=item $h->as_string_unsorted
+
+=item $h->as_string_unsorted( $eol )
+
+Works exactly like L< $h->as_string >, but does not sort the headers, allowing
+it to work about twice as fast. The result is still spec-compliant, since RFC
+2616 Section 4.2 is clear that "the order in which header fields with differing
+field names are received is not significant." The ordering is a "good practice"
+but not a requirement.
 
 =back
 
