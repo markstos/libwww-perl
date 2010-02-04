@@ -234,36 +234,27 @@ sub content_charset
 	return "UTF-8";
     }
     elsif ($self->content_is_html) {
-	# look for <META charset="..."> or <META content="...">
-	# http://dev.w3.org/html5/spec/Overview.html#determining-the-character-encoding
-	my $charset;
-	require HTML::Parser;
-	my $p = HTML::Parser->new(
-	    start_h => [sub {
-		my($tag, $attr, $self) = @_;
-		$charset = $attr->{charset};
-		unless ($charset) {
-		    # look at $attr->{content} ...
-		    if (my $c = $attr->{content}) {
-			require HTTP::Headers::Util;
-			my @v = HTTP::Headers::Util::split_header_words($c);
-			return unless @v;
-			my($ct, undef, %ct_param) = @{$v[0]};
-			$charset = $ct_param{charset};
-		    }
-		    return unless $charset;
-		}
-		if ($charset =~ /^utf-?16/i) {
-		    # converted document, assume UTF-8
-		    $charset = "UTF-8";
-		}
-		$self->eof;
-	    }, "tagname, attr, self"],
-	    report_tags => [qw(meta)],
-	    utf8_mode => 1,
-	);
-	$p->parse($$cref);
-	return $charset if $charset;
+        my $charset;
+        eval { require HTML::Parser; };
+        # No HTML::Parser? We'll use Pure Perl.
+        if ($@) {
+            $charset = $self->_guess_html_charset($cref);
+        }
+        # You have HTML::Parser, this branch might be faster.
+        else {
+            my $p = HTML::Parser->new(
+                start_h => [sub {
+                    my($tag, $attr, $hp) = @_;
+                    $charset = _maybe_get_charset_from_attr($attr);
+                    $hp->eof;
+                }, "tagname, attr, self"],
+                report_tags => [qw(meta)],
+                utf8_mode => 1,
+            );
+            $p->parse($$cref);
+        }
+
+        return $charset if $charset;
     }
     if ($self->content_type =~ /^text\//) {
 	for ($$cref) {
@@ -631,6 +622,165 @@ sub AUTOLOAD
 
 
 sub DESTROY {}  # avoid AUTOLOADing it
+
+
+# look for <META charset="..."> or <META content="...">
+# http://dev.w3.org/html5/spec/Overview.html#determining-the-character-encoding
+sub _guess_html_charset {
+    my $self = shift;
+    my $cref = shift;
+    return undef unless $cref;
+
+    my $html = $$cref;
+
+    my $charset;
+
+    my $s = ''; # current snippet of HTML we are testing and parsing
+    my $offset; # position relative to the beginning of the chunk
+    my $stack;
+    my $tag_with_attr = q#^(<(\w+)((?:\s+[-\w]+(?:\s*=\s*(?:(?:"[^"]*")|(?:'[^']*')|[^>\s]+))?)*)\s*(\/?)>)#;
+    my($original)    = $html;
+
+    for (; $html;) {
+        my $in_content = 1;
+        if (! $$stack[$#$stack]) {
+            # Is it an end tag?
+            $s = substr($html, 0, 2);
+            if ($s eq '</') {
+                if ($html =~ /^(<\/(\w+)[^>]*>)/) {
+                    my ($whole_tag,$tag_name) = ($1,$2);
+                    substr($html, 0, length $whole_tag) = '';
+                    $in_content = 0;
+
+                    # optimization: give up if we get to the end of the <head>
+                    last if $tag_name =~ m/^head$/i
+                }
+            }
+
+            # # Is it a start tag?
+            if ($in_content) {
+                if (substr($html, 0, 1) eq '<') {
+                    if ($html =~ /$tag_with_attr/) {
+                        my ($orig_text,$tag_name,$attr_string,$unary) = ($1,$2,$3,$4);
+                        substr($html, 0, length $orig_text) = '';
+                        $in_content = 0;
+                        if ($tag_name =~ m/^meta$/i) {
+                            my $attr = _parse_attributes($attr_string); 
+                            $charset = _maybe_get_charset_from_attr($attr);
+                            # Found a charset? We're done.
+                            last if $charset;
+                        }
+                    }
+                }
+            }
+
+            # Is it a comment?
+            if ($in_content) {
+                $s = substr($html, 0, 4);
+                if ($s eq '<!--') {
+                    $offset = index($html, '-->');
+
+                    if ($offset >= 0) {
+                        substr($html, 0, $offset + 3) = '';
+                        $in_content = 0;
+                    }
+                }
+            }
+
+            # Is it a doctype?
+            if ($in_content) {
+                $s = substr($html, 0, 9);
+                if ($s eq '<!DOCTYPE') {
+                    $offset = index($html, '>');
+                    if ($offset >= 0) {
+                        substr($html, 0, $offset + 1) = '';
+                        $in_content = 0;
+                    }
+                }
+            }
+
+            if ($in_content) {
+                $offset = index($html, '<');
+                if ($offset < 0) {
+                    $html = '';
+                }
+                else {
+                    substr($html, 0, $offset) = '';
+                }
+            }
+        }
+        if ($html eq $original) {
+            # parse error. Give up.
+            last;
+        }
+
+        $original = $html;
+    }
+    return $charset;
+}
+
+# Given a string of HTML tag attributes, return a hashref of key/value pairs
+our $quote_re  = qr{^([a-zA-Z0-9_-]+)\s*=\s*["]([^"]+)["]\s*(.*)$}so; # regular quotes
+our $squote_re = qr{^([a-zA-Z0-9_-]+)\s*=\s*[']([^']+)[']\s*(.*)$}so; # single quotes
+our $uquote_re = qr{^([a-zA-Z0-9_-]+)\s*=\s*([^\s'"]+)\s*(.*)$}so;    # unquoted
+sub _parse_attributes {
+    my $astring = shift;
+
+    # No attribute string? We're done. 
+    unless (defined $astring and length $astring) {
+        return {};
+    }
+
+    my %attrs;
+
+    # trim leading and trailing whitespace.
+    # XXX faster as two REs?
+    $astring =~ s/^\s+|\s+$//g;
+
+    my $org = $astring;
+    BIT: while (length $astring) {
+        for my  $m ($quote_re, $squote_re, $uquote_re) {
+            if ($astring =~ $m) {
+                my ($var,$val,$suffix) = ($1,$2,$3);
+                $attrs{lc $var} = $val;
+                $astring = $suffix;
+                next BIT;
+            }
+        }
+
+#        if ($astring eq $org) {
+#            croak "parse_attributes: can't parse $astring - not a properly formed attribute string"
+#        }
+
+    }
+
+    return \%attrs;
+}
+
+# Given a hashref of HTML attributes for a <meta> tag, try to
+# find a charset within it . 
+sub _maybe_get_charset_from_attr {
+    my $attr = shift || return undef;
+    my $charset;
+    $charset = $attr->{charset};
+    unless ($charset) {
+        # look at $attr->{content} ...
+        if (my $c = $attr->{content}) {
+            require HTTP::Headers::Util;
+            my @v = HTTP::Headers::Util::split_header_words($c);
+            return unless @v;
+            my($ct, undef, %ct_param) = @{$v[0]};
+            $charset = $ct_param{charset};
+        }
+        return unless $charset;
+    }
+    if ($charset =~ /^utf-?16/i) {
+        # converted document, assume UTF-8
+        $charset = "UTF-8";
+    }
+    return $charset;
+}
+
 
 
 # Private method to access members in %$self

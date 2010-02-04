@@ -44,7 +44,6 @@ WriteMakefile(
         'MIME::Base64'   => "2.1",
         'Net::FTP'       => "2.58",
         'HTML::Tagset'   => 0,
-        'HTML::Parser'   => "3.33",
         'Digest::MD5'    => 0,
         'Compress::Raw::Zlib'        => 0,
         'IO::Compress::Gzip'         => 0,
@@ -56,6 +55,7 @@ WriteMakefile(
     META_MERGE => {
         recommends => {
             'Crypt::SSLeay' => 0,
+            'HTML::Parser'  => 3.33,
         },
 	resources => {
             repository => 'http://gitorious.org/projects/libwww-perl',

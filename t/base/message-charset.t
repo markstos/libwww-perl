@@ -15,7 +15,7 @@ BEGIN {
 }
 
 use Test;
-plan tests => 22;
+plan tests => 23;
 
 use HTTP::Response;
 my $r = HTTP::Response->new(200, "OK");
@@ -37,6 +37,18 @@ ok($r->content_charset, "UTF-8");
 $r->content_type("text/html");
 $r->content(<<'EOT');
 <meta charset="UTF-8">
+EOT
+ok($r->content_charset, "UTF-8");
+
+# Test a document which includes a doctype, as well as closing tags within the </head>
+$r->content(<<'EOT');
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<head>
+<title></title>
+<meta charset="UTF-8">
+</head>
+<body>
+</body>
 EOT
 ok($r->content_charset, "UTF-8");
 
